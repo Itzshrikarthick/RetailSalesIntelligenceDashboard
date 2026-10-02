@@ -1,0 +1,217 @@
+# main.py
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+from collections import defaultdict
+import uuid
+
+app = FastAPI(title="Transaction Insights API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────────────────────────────────────
+# In-memory DB (swap with MongoDB in production)
+# ─────────────────────────────────────────────
+transactions_db: List[dict] = []
+
+# ─────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────
+
+class Transaction(BaseModel):
+    id: Optional[str] = None
+    date: str                          # "YYYY-MM-DD"
+    description: str
+    amount: float
+    type: str = "debit"                # "credit" or "debit"
+    category: Optional[str] = None
+    merchant: Optional[str] = None
+
+class TransactionUpdate(BaseModel):
+    description: Optional[str] = None
+    amount: Optional[float] = None
+    type: Optional[str] = None
+    category: Optional[str] = None
+    merchant: Optional[str] = None
+
+# ─────────────────────────────────────────────
+# Auto-categorization
+# ─────────────────────────────────────────────
+
+CATEGORY_RULES = {
+    "Food & Dining":   ["zomato", "swiggy", "restaurant", "cafe", "pizza", "burger", "food", "eat", "biryani", "dine"],
+    "Transport":       ["uber", "ola", "rapido", "petrol", "fuel", "metro", "bus", "cab", "taxi", "auto"],
+    "Shopping":        ["amazon", "flipkart", "myntra", "mall", "store", "shop", "meesho", "nykaa"],
+    "Utilities":       ["electricity", "water", "gas", "internet", "broadband", "airtel", "jio", "bsnl", "wifi"],
+    "Entertainment":   ["netflix", "hotstar", "spotify", "prime", "movie", "theatre", "youtube", "gaming"],
+    "Health":          ["pharmacy", "hospital", "clinic", "doctor", "medicine", "apollo", "medplus"],
+    "Education":       ["udemy", "coursera", "school", "college", "tuition", "book", "course"],
+    "Salary / Income": ["salary", "payroll", "income", "stipend", "bonus", "freelance", "payment received"],
+    "Investments":     ["mutual fund", "sip", "stocks", "zerodha", "groww", "nps", "fd", "rd"],
+    "EMI / Loan":      ["emi", "loan", "credit card", "hdfc", "icici", "sbi", "kotak"],
+}
+
+def auto_categorize(description: str) -> str:
+    desc = description.lower()
+    for category, keywords in CATEGORY_RULES.items():
+        if any(kw in desc for kw in keywords):
+            return category
+    return "Others"
+
+# ─────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Transaction Insights API running"}
+
+
+# ── Transactions CRUD ──
+
+@app.post("/transactions", response_model=Transaction, status_code=201)
+def create_transaction(txn: Transaction):
+    txn.id = str(uuid.uuid4())
+    if not txn.category:
+        txn.category = auto_categorize(txn.description)
+    transactions_db.append(txn.dict())
+    return txn
+
+
+@app.get("/transactions", response_model=List[Transaction])
+def list_transactions(
+    type: Optional[str] = Query(None, description="Filter by 'credit' or 'debit'"),
+    category: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+):
+    results = transactions_db[:]
+    if type:
+        results = [t for t in results if t["type"] == type]
+    if category:
+        results = [t for t in results if t["category"] == category]
+    if start_date:
+        results = [t for t in results if t["date"] >= start_date]
+    if end_date:
+        results = [t for t in results if t["date"] <= end_date]
+    return results
+
+
+@app.get("/transactions/{txn_id}", response_model=Transaction)
+def get_transaction(txn_id: str):
+    for t in transactions_db:
+        if t["id"] == txn_id:
+            return t
+    raise HTTPException(status_code=404, detail="Transaction not found")
+
+
+@app.put("/transactions/{txn_id}", response_model=Transaction)
+def update_transaction(txn_id: str, update: TransactionUpdate):
+    for t in transactions_db:
+        if t["id"] == txn_id:
+            for field, value in update.dict(exclude_none=True).items():
+                t[field] = value
+            return t
+    raise HTTPException(status_code=404, detail="Transaction not found")
+
+
+@app.delete("/transactions/{txn_id}")
+def delete_transaction(txn_id: str):
+    global transactions_db
+    before = len(transactions_db)
+    transactions_db = [t for t in transactions_db if t["id"] != txn_id]
+    if len(transactions_db) == before:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"message": "Deleted successfully"}
+
+
+# ── Insights / Analytics ──
+
+@app.get("/insights/summary")
+def get_summary():
+    if not transactions_db:
+        return {"message": "No transactions available"}
+
+    total_income   = sum(t["amount"] for t in transactions_db if t["type"] == "credit")
+    total_expenses = sum(t["amount"] for t in transactions_db if t["type"] == "debit")
+    net_balance    = total_income - total_expenses
+
+    return {
+        "total_income":    round(total_income, 2),
+        "total_expenses":  round(total_expenses, 2),
+        "net_balance":     round(net_balance, 2),
+        "total_transactions": len(transactions_db),
+        "savings_rate":    round((net_balance / total_income * 100) if total_income else 0, 2),
+    }
+
+
+@app.get("/insights/by-category")
+def insights_by_category():
+    category_data = defaultdict(lambda: {"total": 0.0, "count": 0})
+    for t in transactions_db:
+        if t["type"] == "debit":
+            cat = t.get("category", "Others")
+            category_data[cat]["total"] += t["amount"]
+            category_data[cat]["count"] += 1
+
+    return [
+        {"category": cat, "total": round(data["total"], 2), "count": data["count"]}
+        for cat, data in sorted(category_data.items(), key=lambda x: x[1]["total"], reverse=True)
+    ]
+
+
+@app.get("/insights/by-month")
+def insights_by_month():
+    monthly = defaultdict(lambda: {"income": 0.0, "expenses": 0.0})
+    for t in transactions_db:
+        try:
+            month = t["date"][:7]  # "YYYY-MM"
+        except Exception:
+            continue
+        if t["type"] == "credit":
+            monthly[month]["income"] += t["amount"]
+        else:
+            monthly[month]["expenses"] += t["amount"]
+
+    return [
+        {
+            "month":    month,
+            "income":   round(data["income"], 2),
+            "expenses": round(data["expenses"], 2),
+            "net":      round(data["income"] - data["expenses"], 2),
+        }
+        for month, data in sorted(monthly.items())
+    ]
+
+
+@app.get("/insights/top-merchants")
+def top_merchants(limit: int = 5):
+    merchant_totals = defaultdict(float)
+    for t in transactions_db:
+        if t.get("merchant") and t["type"] == "debit":
+            merchant_totals[t["merchant"]] += t["amount"]
+
+    sorted_merchants = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)
+    return [
+        {"merchant": m, "total": round(amt, 2)}
+        for m, amt in sorted_merchants[:limit]
+    ]
+
+
+@app.get("/insights/recent")
+def recent_transactions(limit: int = 10):
+    sorted_txns = sorted(
+        transactions_db,
+        key=lambda x: x.get("date", ""),
+        reverse=True
+    )
+    return sorted_txns[:limit]
